@@ -1,0 +1,310 @@
+-- external S3 stage where covid cases related data are stored so that the data in the files can be loaded into a table
+
+create or replace stage s3_data_stage
+    url = 's3://pythonsnowflakepoc/fullData/'
+    credentials=(aws_key_id='AKIAUGPVFFOVVAE4SCFI' aws_secret_key='n8GHWWF0rX4LeCdspYQaWjcNOTE2ibKH3AHoC6s+')
+    FILE_FORMAT = ( FORMAT_NAME = 'json')
+    comment = 'sample stage'
+    
+    
+    
+-- external S3 stage where country related files are stored so that the data in the files can be loaded into a table
+
+create or replace stage s3_countries_stage
+    url = 's3://pythonsnowflakepoc/countries/'
+    credentials=(aws_key_id='AKIAUGPVFFOVVAE4SCFI' aws_secret_key='n8GHWWF0rX4LeCdspYQaWjcNOTE2ibKH3AHoC6s+')
+    FILE_FORMAT = ( FORMAT_NAME = 'csv')
+    comment = 'sample stage'
+
+
+
+
+
+-- external table for storing covid cases data which is in s3_data_stage atage
+
+create or replace external table Data(
+    name variant as (value:data::variant)    
+    )
+    with location = @s3_data_stage
+    auto_refresh = false
+    file_format = (format_name = 'json') 
+
+
+
+
+
+
+-- external table for storing countries data which is in s3_countries_stage stage
+
+create or replace external table Countries(
+    country_code varchar as (value:c1::varchar),
+    country_name varchar as (value:c2::varchar)
+    )
+    with location = @s3_countries_stage
+    auto_refresh = false
+    file_format = (format_name = 'csv')
+
+
+
+
+
+-- stream for capturing changes in the Data external table
+
+create or replace stream stream_Data on external table Data insert_only = true;
+
+
+
+
+
+
+
+
+-- internal table for storing covid cases data in corresponding columns
+
+create or replace table cases_fact(
+    Sk integer autoincrement start 1 increment 1,
+    Confirmed integer,
+    CountryId varchar,
+    DateValue timestamp,
+    Deaths integer,
+    Stringency integer,
+    StringencyActual integer,
+    StringencyLegacy integer,
+    StringencyLegacyDisp integer)
+);   
+
+
+
+
+
+
+-- internal table for storing dates related data
+
+create or replace table date_dim(
+    Id integer autoincrement start 1 increment 1,
+    Date date,
+    Day integer as day(Date),
+    DayName varchar as dayname(Date),
+    Week integer as WEEKOFYEAR(Date),
+    DayOfWeek integer as DAYOFWEEK(Date),
+    Month integer as month(Date),
+    MonthName varchar as MONTHNAME(Date),
+    Quarter integer as quarter(Date),
+    Year integer as year(Date),
+    FirstOfMonth date as to_date(concat(to_varchar(year(Date)),'-', to_varchar(month(Date)),'-', '01')),
+    LastOfYear date as to_date(concat(to_varchar(year(Date)),'-','12-', '31')),
+    DayOfYear integer as dayofyear(Date)
+    );
+
+
+
+
+
+-- internal table for storing countries related data
+
+create or replace table country_dim(
+    CountryId integer autoincrement start 1 increment 1,
+    CountryCode varchar,
+    CountryName varchar
+);
+
+
+
+
+
+
+
+-- internal table for storing files logs which are loaded into internal tables whether successfully or not
+
+create or replace table metadata.table_log(
+    Log_Id integer autoincrement start 1 increment 1,
+    Procedure_Name varchar,
+    Source varchar,
+    Target varchar,
+    Load_Status varchar,
+    Message varchar,
+    Insert_Time timestamp,
+    Update_Time timestamp
+);
+
+
+
+
+
+-- internal table for storing files logs which are placed into S3 whether successfully or not
+
+create or replace table metadata.file_log(
+    Log_Id integer autoincrement start 1 increment 1,
+    Batch_start_Date date,
+    Batch_End_Date date,
+    File_Name varchar,
+    Status varchar,
+    Insert_Time timestamp,
+    Update_Time timestamp
+);
+
+
+
+
+
+
+
+
+
+
+-- stored procedure for loading covid cases data from external table to internal table and logs the details whether loaded successfully or not
+
+create or replace procedure sp_data_stream_proc()
+returns string
+language javascript
+AS
+$$
+
+var stmnt_alter = snowflake.createStatement({sqlText: "alter external table data refresh"});
+stmnt_alter.execute();
+
+var stmnt1 = snowflake.createStatement({sqlText: "truncate table cases_stg"});
+stmnt1.execute();
+
+var cmd_stg = "insert into cases_stg(CONFIRMED, COUNTRYID, DATEVALUE, DEATHS, STRINGENCY, STRINGENCYACTUAL, STRINGENCYLEGACY, STRINGENCYLEGACYDISP, file_name  ) SELECT b.value:confirmed::integer,b.value:country_code::varchar,b.value:date_value::timestamp,b.value:deaths::integer,b.value:stringency::integer,b.value:stringency_actual::integer,b.value:stringency_legacy::integer,b.value:stringency_legacy_disp::integer, metadata$filename from stream_data , lateral flatten ( input => stream_data.name ) a, lateral flatten ( input => a.value ) b";
+var stmt_stg = snowflake.createStatement({sqlText: cmd_stg});
+stmt_stg.execute();
+
+var cmd2 = "insert into metadata.table_log (Procedure_Name, Target, Source, Load_Status, Insert_Time) select distinct 'sp_data_stream_proc', 'cases_fact', file_name , 'In Progress', current_timestamp from cases_stg";
+var stmt2 = snowflake.createStatement({sqlText: cmd2});
+stmt2.execute();
+
+try{
+var cmd3 = "insert into cases_fact(CONFIRMED, COUNTRYID, DATEVALUE, DEATHS, STRINGENCY, STRINGENCYACTUAL, STRINGENCYLEGACY, STRINGENCYLEGACYDISP  ) SELECT CONFIRMED, COUNTRYID, DATEVALUE, DEATHS, STRINGENCY, STRINGENCYACTUAL, STRINGENCYLEGACY, STRINGENCYLEGACYDISP from cases_stg";
+var stmt3 = snowflake.createStatement({sqlText: cmd3});
+stmt3.execute();
+
+var cmd4 = "update metadata.table_log set Load_Status = 'Success' , Update_Time = current_timestamp where Log_Id = (select max(Log_Id) from metadata.table_log where Target='cases_fact' and Load_Status='In Progress')";
+var stmt4 = snowflake.createStatement({sqlText: cmd4});
+stmt4.execute();
+
+return 'Try block success'
+
+}
+
+catch(err){
+
+var stmt5 = snowflake.createStatement({sqlText: "update metadata.table_log set Load_Status = 'Fail', Update_Time = current_timestamp, Message = (?) where Log_Id = (select max(Log_Id) from metadata.table_log where Target='cases_fact' and Load_Status='In Progress')", binds: [err.message]});
+stmt5.execute();
+
+return 'Catch block success';
+}
+$$;
+
+
+
+
+
+
+
+
+
+
+-- stored procedure for loading dates related information based on given start date and end date and logs the details whether loaded successfully or not
+
+create or replace procedure proc_date_dim(a string, b string)
+returns string
+language javascript
+AS
+$$
+    var dat1 = new Date(A);
+    var dat2 = new Date(B);
+    dat1.setDate(dat1.getDate()+1);
+    dat2.setDate(dat2.getDate()+1);
+    
+    
+    var cmd1 = "insert into metadata.table_log (Procedure_Name, Target, Source, Load_Status, Insert_Time) values ('proc_date_dim', 'date_dim', 'Generated Values' , 'In Progress', current_timestamp)";
+    var stmt1 = snowflake.createStatement({sqlText: cmd1});
+    stmt1.execute();
+    
+    try{
+        while(dat1<=dat2){
+        var y = String(dat1.getFullYear());
+        var m = String(dat1.getMonth()+1);
+        var d = String(dat1.getDate());
+        var res = y.concat('-',m,'-',d)
+        var cmd = "insert into date_dim (Date) values ('" + res + "')";
+        var stmt = snowflake.createStatement({sqlText: cmd});
+        stmt.execute();
+        dat1.setDate(dat1.getDate()+1);            
+        }    
+    
+    
+    var cmd4 = "update metadata.table_log set Load_Status = 'Success' , Update_Time = current_timestamp where Log_Id = (select max(Log_Id) from metadata.table_log where Target='date_dim' and Load_Status='In Progress')";
+    var stmt4 = snowflake.createStatement({sqlText: cmd4});
+    stmt4.execute();
+    
+    
+    return 'Try block success';   
+    }
+    
+    
+    
+    catch(err){
+//            var cmd5 = "update metadata.table_log set Load_Status = 'Fail', Update_Time = current_timestamp, Message = (?) where Log_Id = (select max(Log_Id) from metadata.table_log where Target='country_dim' and Load_Status='In Progress')";
+            var stmt5 = snowflake.createStatement({sqlText: "update metadata.table_log set Load_Status = 'Fail', Update_Time = current_timestamp, Message = (?) where Log_Id = (select max(Log_Id) from metadata.table_log where Target='date_dim' and Load_Status='In Progress')", binds: [err.message]});
+            stmt5.execute();
+
+            return 'Catch block success';
+        }      
+    
+    
+    
+    
+$$;
+
+
+
+
+
+
+
+
+
+-- stored procedure for loading countries related information based on given start date and end date and logs the details whether loaded successfully or not
+
+create or replace procedure sp_country_dim()
+returns string
+language javascript
+AS
+$$
+        var cmd1 = "truncate table country_dim";
+        var stmt1 = snowflake.createStatement({sqlText: cmd1});
+        stmt1.execute();
+        
+        
+        var cmd2 = "insert into metadata.table_log (Procedure_Name, Target, Source, Load_Status, Insert_Time) select distinct 'sp_country_dim', 'country_dim', metadata$filename , 'In Progress', current_timestamp from Countries";
+        var stmt2 = snowflake.createStatement({sqlText: cmd2});
+        stmt2.execute();
+        
+        try{            
+            var cmd3 = "insert into country_dim (CountryCode, CountryName) select country_code, country_name from Countries"; 
+            var stmt3 = snowflake.createStatement({sqlText: cmd3});
+            stmt3.execute();
+            
+            
+
+            var cmd4 = "update metadata.table_log set Load_Status = 'Success' , Update_Time = current_timestamp where Log_Id = (select max(Log_Id) from metadata.table_log where Target='country_dim' and Load_Status='In Progress')";
+            var stmt4 = snowflake.createStatement({sqlText: cmd4});
+            stmt4.execute();
+            
+            return 'Try block success'
+            
+        }
+        
+        
+        
+        catch(err){
+//            var cmd5 = "update metadata.table_log set Load_Status = 'Fail', Update_Time = current_timestamp, Message = (?) where Log_Id = (select max(Log_Id) from metadata.table_log where Target='country_dim' and Load_Status='In Progress')";
+            var stmt5 = snowflake.createStatement({sqlText: "update metadata.table_log set Load_Status = 'Fail', Update_Time = current_timestamp, Message = (?) where Log_Id = (select max(Log_Id) from metadata.table_log where Target='country_dim' and Load_Status='In Progress')", binds: [err.message]});
+            stmt5.execute();
+
+            return 'Catch block success';
+        }        
+$$;
+
